@@ -139,13 +139,13 @@ def login_page():
         with st.form("login_form"):
             email = st.text_input(
                 "Email Address",
-                placeholder="e.g., aniket_ladse@thermofisher.com",
+                placeholder="aniket.ladse@thermofisher.com",
                 help="Use your ThermoFisher email address"
             )
             
             name = st.text_input(
                 "Full Name",
-                placeholder="e.g., Aniket Ladse",
+                placeholder="Full Name",
                 help="Enter your full name"
             )
             
