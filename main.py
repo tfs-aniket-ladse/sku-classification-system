@@ -283,8 +283,8 @@ def get_unique_business_units(df):
         print(f"Error getting business units: {str(e)}")
         return []
 
-def check_feedback_correction(sku_input, name_input):
-    """Check if this SKU has user feedback (likes or corrections) with model retrain info"""
+def check_feedback_correction(sku_input, name_input, prediction_product_line=None, prediction_cmr=None):
+    """Check if this specific prediction has user feedback (likes or corrections) with model retrain info"""
     try:
         feedback_file = os.path.join('feedback_data', 'bulk_user_feedback.json')
         if not os.path.exists(feedback_file):
@@ -300,26 +300,36 @@ def check_feedback_correction(sku_input, name_input):
         if not retrain_info:
             return None  # Only show enhanced indicators after model retraining
         
-        # Look for feedback for this SKU/name combination
+        # Look for feedback for this specific SKU/name AND prediction combination
         for feedback in feedback_list:
-            # More flexible matching
+            # Match SKU input
             sku_match = (
                 feedback.get('sku_input', '').strip().upper() == sku_input.strip().upper() or
                 feedback.get('predicted_sku_number', '').strip().upper() == sku_input.strip().upper()
             )
             
+            # Match name input
             name_match = (
                 feedback.get('name_input', '').strip().lower() == name_input.strip().lower() or
                 feedback.get('predicted_sku_name', '').strip().lower() == name_input.strip().lower()
             )
             
+            # Match specific prediction details
+            prediction_match = True
+            if prediction_product_line:
+                prediction_match = prediction_match and (
+                    feedback.get('predicted_product_line_code', '').strip() == prediction_product_line.strip()
+                )
+            if prediction_cmr:
+                prediction_match = prediction_match and (
+                    feedback.get('predicted_cmr_line', '').strip() == prediction_cmr.strip()
+                )
+            
             feedback_type = feedback.get('feedback')
             has_correction = feedback.get('correction_provided', False)
             
-            # Show enhanced indicators for:
-            # 1. Likes (confirmed correct predictions) - after model retrain
-            # 2. Dislikes with corrections (user-provided corrections) - after model retrain
-            if (sku_match or name_match) and (feedback_type == 'like' or (feedback_type == 'dislike' and has_correction)):
+            # Show enhanced indicators only for the specific prediction that received feedback
+            if (sku_match or name_match) and prediction_match and (feedback_type == 'like' or (feedback_type == 'dislike' and has_correction)):
                 # For likes, use the predicted data as the "correct" data since it was confirmed
                 if feedback_type == 'like':
                     correct_pl = feedback.get('predicted_product_line_code', '')
@@ -702,9 +712,6 @@ def get_exact_predictions(df, sku_partial, name_partial):
     if not sku_partial.strip() and not name_partial.strip():
         return pd.DataFrame()
     
-    # Check for feedback corrections first
-    feedback_correction = check_feedback_correction(sku_partial, name_partial)
-    
     df_copy = df.copy()
     
     if sku_partial.strip():
@@ -719,39 +726,12 @@ def get_exact_predictions(df, sku_partial, name_partial):
         subset=['sku number', 'sku name', 'product line code', 'cmr product line']
     ).head(10)
     
-    # If we have feedback correction, add it as a special row at the top
-    if feedback_correction and feedback_correction['correct_product_line']:
-        correction_row = pd.DataFrame([{
-            'sku number': sku_partial,
-            'sku name': name_partial,
-            'product line code': feedback_correction['correct_product_line'],
-            'cmr product line': 'Updated via Feedback',
-            'product line name': 'Updated via User Feedback',
-            'sub platform': feedback_correction.get('correct_business_unit', 'Updated via Feedback'),
-            'is_feedback_correction': True,
-            'feedback_type': feedback_correction.get('feedback_type', 'correction'),
-            'corrected_by': feedback_correction['corrected_by'],
-            'correction_date': feedback_correction['correction_date'],
-            'correction_comment': feedback_correction.get('user_comment', ''),
-            'model_retrain_date': feedback_correction.get('model_retrain_date'),
-            'retrained_by': feedback_correction.get('retrained_by')
-        }])
-        
-        # Add correction row at the top
-        if not result_df.empty:
-            result_df = pd.concat([correction_row, result_df], ignore_index=True)
-        else:
-            result_df = correction_row
-    
     return result_df
 
 def get_fuzzy_predictions(df, sku_partial, name_partial, vectorizer, tfidf_matrix, top_k=5):
     """Get fuzzy predictions with feedback-based prioritization"""
     if not sku_partial.strip() and not name_partial.strip():
         return []
-    
-    # Check for user feedback corrections first
-    feedback_correction = check_feedback_correction(sku_partial, name_partial)
     
     query_text = f"{sku_partial} {name_partial}".lower()
     query_vector = vectorizer.transform([query_text])
@@ -764,33 +744,8 @@ def get_fuzzy_predictions(df, sku_partial, name_partial, vectorizer, tfidf_matri
     # Load hierarchy data for Product Line - LV 2
     df_hierarchy = st.session_state.get('df_hierarchy')
     
-    # If we have a feedback correction, prioritize it
-    if feedback_correction and feedback_correction['correct_product_line']:
-        # Create high-confidence corrected prediction
-        corrected_prediction = {
-            'sku_number': sku_partial,
-            'sku_name': name_partial,
-            'product_line_code': feedback_correction['correct_product_line'],
-            'cmr_product_line': 'Updated via Feedback',  # Will be determined by mapping
-            'product_line_name': 'Updated via User Feedback',
-            'product_line_lv2': get_product_line_lv2(feedback_correction['correct_product_line'], df_hierarchy),
-            'sub_platform': feedback_correction.get('correct_business_unit', 'Updated via Feedback'),
-            'sku_score': 100.0,
-            'name_score': 100.0,
-            'combined_score': 95.0,  # High confidence for corrected predictions
-            'is_feedback_correction': True,
-            'feedback_type': feedback_correction.get('feedback_type', 'correction'),
-            'corrected_by': feedback_correction['corrected_by'],
-            'correction_date': feedback_correction['correction_date'],
-            'correction_comment': feedback_correction.get('user_comment', ''),
-            'model_retrain_date': feedback_correction.get('model_retrain_date'),
-            'retrained_by': feedback_correction.get('retrained_by')
-        }
-        results.append(corrected_prediction)
-        top_k -= 1  # Reduce remaining slots
-    
     for idx in top_indices:
-        if len(results) >= top_k + (1 if feedback_correction else 0) or similarities[idx] < 0.1:
+        if len(results) >= top_k or similarities[idx] < 0.1:
             continue
             
         row = df.iloc[idx]
@@ -808,7 +763,10 @@ def get_fuzzy_predictions(df, sku_partial, name_partial, vectorizer, tfidf_matri
             # Get Product Line - LV 2
             product_line_lv2 = get_product_line_lv2(adj_code, df_hierarchy)
             
-            results.append({
+            # Check if this specific prediction has feedback
+            feedback_correction = check_feedback_correction(sku_partial, name_partial, adj_code, correct_cmr)
+            
+            prediction = {
                 'sku_number': row['sku number'],
                 'sku_name': row['sku name'],
                 'product_line_code': adj_code,
@@ -820,7 +778,21 @@ def get_fuzzy_predictions(df, sku_partial, name_partial, vectorizer, tfidf_matri
                 'name_score': round(calculate_simple_similarity(name_partial, str(row['sku name'])), 2),
                 'combined_score': round(similarities[idx] * 100, 2),
                 'is_feedback_correction': False
-            })
+            }
+            
+            # Add feedback information if available
+            if feedback_correction:
+                prediction.update({
+                    'is_feedback_correction': True,
+                    'feedback_type': feedback_correction.get('feedback_type', 'correction'),
+                    'corrected_by': feedback_correction['corrected_by'],
+                    'correction_date': feedback_correction['correction_date'],
+                    'correction_comment': feedback_correction.get('user_comment', ''),
+                    'model_retrain_date': feedback_correction.get('model_retrain_date'),
+                    'retrained_by': feedback_correction.get('retrained_by')
+                })
+            
+            results.append(prediction)
     
     return results
 
@@ -921,19 +893,22 @@ def display_exact_matches(exact_matches, sku_input, name_input, df):
     st.success(f"{len(exact_matches)} Strong Prediction(s) Found")
     
     for idx, row in exact_matches.iterrows():
-        # Check if this is a feedback correction
-        is_correction = row.get('is_feedback_correction', False)
+        # Adjust code/name for 2D/3D CMR
+        adj_code, adj_name, adj_cmr = adjust_product_line_for_volume(
+            row['cmr product line'], row['product line code'], row['product line name'], row['sku name']
+        )
+        
+        # Check if this specific prediction has feedback
+        feedback_correction = check_feedback_correction(sku_input, name_input, adj_code, adj_cmr)
+        is_correction = feedback_correction is not None
         
         if is_correction:
-            adj_code = row['product line code']
-            adj_name = row['product line name']
-            adj_cmr = row['cmr product line']
-            title = f"✨ UPDATED Match {idx + 1}: {adj_code} - {adj_cmr} - 🔄 User Corrected"
+            feedback_type = feedback_correction.get('feedback_type', 'correction')
+            if feedback_type == 'like':
+                title = f"🌟 ENHANCED Match {idx + 1}: {adj_code} - {adj_cmr} - ✅ User Confirmed"
+            else:
+                title = f"🔄 RETRAINED Match {idx + 1}: {adj_code} - {adj_cmr} - 🔧 User Corrected"
         else:
-            # Adjust code/name for 2D/3D CMR
-            adj_code, adj_name, adj_cmr = adjust_product_line_for_volume(
-                row['cmr product line'], row['product line code'], row['product line name'], row['sku name']
-            )
             title = f"Match {idx + 1}: {adj_code} - {adj_cmr}"
         
         # Get Product Line - LV 2
@@ -954,7 +929,7 @@ def display_exact_matches(exact_matches, sku_input, name_input, df):
                 
                 # Show enhanced feedback correction info
                 if is_correction:
-                    feedback_type = row.get('feedback_type', 'correction')
+                    feedback_type = feedback_correction.get('feedback_type', 'correction')
                     if feedback_type == 'like':
                         st.markdown("""
                         <div style="background-color: #e8f5e8; padding: 10px; border-radius: 5px; border-left: 4px solid #28a745;">
@@ -962,7 +937,7 @@ def display_exact_matches(exact_matches, sku_input, name_input, df):
                             <small>This prediction was confirmed correct by user feedback</small>
                         </div>
                         """, unsafe_allow_html=True)
-                        st.caption(f"Originally confirmed by: {row.get('corrected_by', 'Unknown')}")
+                        st.caption(f"Originally confirmed by: {feedback_correction.get('corrected_by', 'Unknown')}")
                     else:
                         st.markdown("""
                         <div style="background-color: #e8f5e8; padding: 10px; border-radius: 5px; border-left: 4px solid #28a745;">
@@ -970,15 +945,15 @@ def display_exact_matches(exact_matches, sku_input, name_input, df):
                             <small>This prediction was improved through model retraining</small>
                         </div>
                         """, unsafe_allow_html=True)
-                        st.caption(f"Originally corrected by: {row.get('corrected_by', 'Unknown')}")
-                    st.caption(f"Feedback date: {row.get('correction_date', 'Unknown')}")
-                    if row.get('model_retrain_date'):
-                        st.caption(f"🕒 Model last updated: {row.get('model_retrain_date')}")
+                        st.caption(f"Originally corrected by: {feedback_correction.get('corrected_by', 'Unknown')}")
+                    st.caption(f"Feedback date: {feedback_correction.get('correction_date', 'Unknown')}")
+                    if feedback_correction.get('model_retrain_date'):
+                        st.caption(f"🕒 Model last updated: {feedback_correction.get('model_retrain_date')}")
             
             # Show enhanced feedback correction details
             if is_correction:
                 st.markdown("---")
-                feedback_type = row.get('feedback_type', 'correction')
+                feedback_type = feedback_correction.get('feedback_type', 'correction')
                 if feedback_type == 'like':
                     st.markdown("""
                     <div style="background-color: #d4edda; padding: 15px; border-radius: 8px; border: 1px solid #c3e6cb;">
@@ -994,19 +969,19 @@ def display_exact_matches(exact_matches, sku_input, name_input, df):
                     </div>
                     """, unsafe_allow_html=True)
                 
-                if row.get('correction_comment'):
-                    st.write("**Original User Feedback:**", row['correction_comment'])
+                if feedback_correction.get('correction_comment'):
+                    st.write("**Original User Feedback:**", feedback_correction['correction_comment'])
                 
                 # Model update information
                 col_a, col_b = st.columns(2)
                 with col_a:
-                    st.write(f"👥 **Originally corrected by:** {row.get('corrected_by', 'Unknown user')}")
-                    st.write(f"📅 **Correction date:** {row.get('correction_date', 'Unknown')}")
+                    st.write(f"👥 **Originally corrected by:** {feedback_correction.get('corrected_by', 'Unknown user')}")
+                    st.write(f"📅 **Correction date:** {feedback_correction.get('correction_date', 'Unknown')}")
                 with col_b:
-                    if row.get('model_retrain_date'):
-                        st.write(f"🔄 **Model retrained on:** {row.get('model_retrain_date')}")
-                        if row.get('retrained_by'):
-                            st.write(f"🔧 **Retrained by:** {row.get('retrained_by')}")
+                    if feedback_correction.get('model_retrain_date'):
+                        st.write(f"🔄 **Model retrained on:** {feedback_correction.get('model_retrain_date')}")
+                        if feedback_correction.get('retrained_by'):
+                            st.write(f"🔧 **Retrained by:** {feedback_correction.get('retrained_by')}")
                     
                 st.markdown("""
                 <div style="background-color: #d1ecf1; padding: 8px; border-radius: 4px; margin-top: 10px;">
